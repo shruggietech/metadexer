@@ -1,2 +1,3 @@
-# shruggie-catalog
-A structured database of IndexEntry records (the outputs created by shruggie-indexer) and the references (collections, projects, users, snapshots, versions, tags, etc) that point to them.
+# metadexer
+
+Content-addressed asset management system for ingesting, deduplicating, cataloging, and searching large heterogeneous data collections across local and S3-compatible storage.
