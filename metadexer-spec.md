@@ -9,7 +9,7 @@
 | License | [Apache License v2.0](https://www.apache.org/licenses/LICENSE-2.0) |
 | Version | Pre-release (0.1.0 target) |
 | Author | William Thompson (ShruggieTech LLC) |
-| Latest Revision Date | 2026-03-09 |
+| Latest Revision Date | 2026-03-19 |
 | Document Status | DRAFT |
 | Audience | AI-first, Human-second |
 
@@ -53,6 +53,7 @@
   - [6.4. Hybrid Storage Routing](#64-hybrid-storage-routing)
   - [6.5. Catalog-Indexer Contract](#65-catalog-indexer-contract)
   - [6.6. Invariants](#66-invariants)
+  - [6.7. Catalog Database Schema](#67-catalog-database-schema)
 - [7. Sync Module](#7-sync-module)
   - [7.1. Purpose](#71-purpose)
   - [7.2. Pipeline Stages](#72-pipeline-stages)
@@ -82,6 +83,7 @@
 - [13. Configuration](#13-configuration)
   - [13.1. Configuration Architecture](#131-configuration-architecture)
   - [13.2. Application Data Directory](#132-application-data-directory)
+  - [13.3. Configuration Keys and Defaults](#133-configuration-keys-and-defaults)
 - [14. File Encoding and JSON Conventions](#14-file-encoding-and-json-conventions)
   - [14.1. File Encoding and Line Endings](#141-file-encoding-and-line-endings)
   - [14.2. JSON Conventions](#142-json-conventions)
@@ -92,6 +94,9 @@
 - [16. Logging and Diagnostics](#16-logging-and-diagnostics)
 - [17. Testing](#17-testing)
 - [18. Packaging and Distribution](#18-packaging-and-distribution)
+  - [18.1. pyproject.toml Configuration](#181-pyprojecttoml-configuration)
+  - [18.2. Build and Release Pipeline](#182-build-and-release-pipeline)
+  - [18.3. Version Management](#183-version-management)
 - [19. Platform Portability](#19-platform-portability)
   - [19.1. Cross-Platform Design Principles](#191-cross-platform-design-principles)
   - [19.2. Platform-Specific Considerations](#192-platform-specific-considerations)
@@ -383,14 +388,26 @@ The vault module provides content-addressed byte storage. It preserves raw file 
 | Operation | Description |
 |-----------|-------------|
 | <span style="white-space: nowrap;">**put**</span> | Store bytes under the `storage_name` key. Write-once: if the key already exists with identical content, the operation is a no-op. If the key exists with different content, this is a hash collision and MUST be surfaced as an error. |
-| <span style="white-space: nowrap;">**get**</span> | Retrieve bytes by `id` or `storage_name`. |
+| <span style="white-space: nowrap;">**get**</span> | Retrieve bytes by `storage_name`. The vault does not resolve `id` to `storage_name`; that mapping is the caller's responsibility (typically resolved via a catalog lookup). This preserves the vault's "no catalog knowledge" invariant ([§5.4](#54-invariants)). |
 | <span style="white-space: nowrap;">**head**</span> | Check existence of an object without retrieving its bytes. |
 | <span style="white-space: nowrap;">**verify**</span> | Re-hash stored bytes and compare against a provided IndexEntry. Verification is always explicit, never triggered automatically during ingest. |
 | <span style="white-space: nowrap;">**prune**</span> | Remove unreferenced objects. Pruning is always explicit, never triggered automatically. Requires reconciliation against the catalog to determine which objects are unreferenced. |
 
 ### 5.3. Storage Backends
 
-**Local filesystem.** The primary backend for local-mode operation. Objects are stored as files in a content-addressed directory structure under a configurable vault root path.
+**Local filesystem.** The primary backend for local-mode operation. Objects are stored as files in a content-addressed directory structure under a configurable vault root path. The directory layout uses a two-character prefix sharding scheme derived from the first two characters of the `storage_name`:
+
+```
+<vault_root>/<prefix>/<storage_name>
+```
+
+Given a vault root of `/data/vault` and a `storage_name` of `a1b2c3d4e5f6.mp4`, the full storage path is:
+
+```
+/data/vault/a1/a1b2c3d4e5f6.mp4
+```
+
+The prefix is always the first two characters of `storage_name`, lowercased. This produces a maximum of 1,296 prefix directories (36^2, given the alphanumeric character set of `storage_name`), which prevents performance degradation from single directories with millions of entries while keeping the tree shallow enough for manual inspection. Prefix directories are created on demand during `put` operations.
 
 **S3-compatible object storage.** For remote or hybrid deployments. Compatible with AWS S3, MinIO, MEGA S4, and any S3-compatible API. Objects are stored as keys in a configured bucket using the `storage_name` as the object key.
 
@@ -442,7 +459,13 @@ The catalog module is the metadata registry and search engine. It records and in
 
 The catalog implements hybrid storage routing. Small text-based content (e.g., a 500-byte JSON response from an API feed) is stored inline as string data within the catalog database for instant full-text search. Large or binary content (e.g., a 4 GB video file) is routed to the vault. Both types are tracked by the same catalog with the same identity model.
 
-Storage routing is determined by configurable rulesets and by explicit user direction at ingestion time. The rulesets consider factors including file size, MIME type, and content characteristics. The exact threshold and rule configuration is defined in the configuration system ([§13](#13-configuration)).
+Storage routing is determined by configurable rulesets and by explicit user direction at ingestion time. The default ruleset applies the following rules in order:
+
+1. **MIME type eligibility.** Only MIME types in the `text/*` family (e.g., `text/plain`, `text/html`, `text/csv`, `text/xml`) and `application/json` are eligible for inline storage. All other MIME types are routed to the vault regardless of size.
+2. **Size threshold.** Eligible content whose `size.bytes` is less than or equal to `65536` (64 KB) is stored inline. Eligible content exceeding this threshold is routed to the vault.
+3. **Explicit override.** A CLI flag (`--force-vault` or `--force-inline`) overrides the ruleset for a given ingestion run. `--force-vault` routes all content to the vault. `--force-inline` routes all eligible MIME types to inline storage regardless of size (binary types are never eligible for inline storage regardless of this flag).
+
+These defaults are configurable via the `[storage_routing]` section of the configuration TOML ([§13](#13-configuration)). The configuration keys are `inline_mime_prefixes` (list of MIME type prefixes eligible for inline storage), `inline_max_bytes` (integer size threshold), and `inline_extra_types` (list of additional full MIME types eligible beyond the prefix list).
 
 ### 6.5. Catalog-Indexer Contract
 
@@ -457,6 +480,115 @@ This transient nature is correct by design. The indexer produces accurate snapsh
 - Reference deletion removes the reference, not the underlying asset.
 - Physical deletion from the vault requires a separate, explicit prune operation.
 - The catalog does not store raw bytes (except inline string content per hybrid routing rules).
+
+### 6.7. Catalog Database Schema
+
+This section defines the Phase 2 catalog schema. The schema covers the primary assets table required for IndexEntry ingestion, field projection, basic search, and hybrid inline storage. Reference tracking tables (collections, projects, tenants, snapshots) are deferred to Phase 4 and will be specified before that phase begins.
+
+#### 6.7.1. PostgreSQL Schema
+
+```sql
+CREATE TABLE assets (
+    -- Identity (unique, content-addressed)
+    id              TEXT        NOT NULL,
+
+    -- Projected IndexEntry fields (searchable columns)
+    schema_version  INTEGER     NOT NULL,
+    type            TEXT        NOT NULL,       -- "file" or "directory"
+    mime_type       TEXT,                       -- e.g., "image/jpeg", "text/plain"
+    extension       TEXT,                       -- lowercase, no leading dot
+    name_text       TEXT,                       -- IndexEntry name.text
+    name_normalized TEXT,                       -- IndexEntry name.normalized
+    size_bytes      BIGINT,                     -- IndexEntry size.bytes
+    ts_modified     TIMESTAMPTZ,                -- IndexEntry timestamps.modified.value
+    ts_created      TIMESTAMPTZ,                -- IndexEntry timestamps.created.value
+    storage_name    TEXT        NOT NULL,       -- Vault storage key
+    storage_mode    TEXT        NOT NULL        -- "vault" or "inline"
+                    CHECK (storage_mode IN ('vault', 'inline')),
+
+    -- Raw IndexEntry preservation
+    raw_entry       JSONB       NOT NULL,       -- Complete IndexEntry JSON, immutable
+
+    -- Inline content (hybrid storage routing)
+    inline_content  TEXT,                       -- Populated only when storage_mode = 'inline'
+
+    -- Full-text search (PostgreSQL native)
+    search_vector   TSVECTOR,                   -- Derived from name_text and inline_content
+
+    -- Bookkeeping
+    ingested_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Constraints
+    CONSTRAINT pk_assets PRIMARY KEY (id),
+    CONSTRAINT uq_assets_storage_name UNIQUE (storage_name)
+);
+
+-- Indexes for common query patterns (§21.2)
+CREATE INDEX idx_assets_mime_type   ON assets (mime_type);
+CREATE INDEX idx_assets_extension   ON assets (extension);
+CREATE INDEX idx_assets_size_bytes  ON assets (size_bytes);
+CREATE INDEX idx_assets_ts_modified ON assets (ts_modified);
+CREATE INDEX idx_assets_name_text   ON assets USING gin (to_tsvector('simple', name_text));
+CREATE INDEX idx_assets_search      ON assets USING gin (search_vector);
+```
+
+The `search_vector` column is maintained by a trigger that rebuilds it on INSERT and UPDATE from `name_text` and `inline_content` using the `'simple'` text search configuration.
+
+#### 6.7.2. SQLite Schema
+
+```sql
+CREATE TABLE assets (
+    -- Identity (unique, content-addressed)
+    id              TEXT        NOT NULL PRIMARY KEY,
+
+    -- Projected IndexEntry fields (searchable columns)
+    schema_version  INTEGER     NOT NULL,
+    type            TEXT        NOT NULL,
+    mime_type       TEXT,
+    extension       TEXT,
+    name_text       TEXT,
+    name_normalized TEXT,
+    size_bytes      INTEGER,
+    ts_modified     TEXT,       -- ISO 8601 string (SQLite has no native timestamp type)
+    ts_created      TEXT,       -- ISO 8601 string
+    storage_name    TEXT        NOT NULL UNIQUE,
+    storage_mode    TEXT        NOT NULL CHECK (storage_mode IN ('vault', 'inline')),
+
+    -- Raw IndexEntry preservation
+    raw_entry       TEXT        NOT NULL,       -- Complete IndexEntry JSON string
+
+    -- Inline content (hybrid storage routing)
+    inline_content  TEXT,
+
+    -- Bookkeeping
+    ingested_at     TEXT        NOT NULL        -- ISO 8601 string
+);
+
+-- Indexes for common query patterns (§21.2)
+CREATE INDEX idx_assets_mime_type   ON assets (mime_type);
+CREATE INDEX idx_assets_extension   ON assets (extension);
+CREATE INDEX idx_assets_size_bytes  ON assets (size_bytes);
+CREATE INDEX idx_assets_ts_modified ON assets (ts_modified);
+
+-- Full-text search via FTS5 virtual table
+CREATE VIRTUAL TABLE assets_fts USING fts5(
+    id UNINDEXED,
+    name_text,
+    inline_content,
+    content='assets',
+    content_rowid='rowid'
+);
+```
+
+The SQLite FTS5 virtual table is kept synchronized with the `assets` table via triggers on INSERT, UPDATE, and DELETE. The `content=` and `content_rowid=` options configure FTS5 as a content-external table (it reads content from `assets` rather than storing its own copy).
+
+#### 6.7.3. Schema Notes
+
+The `raw_entry` column stores the complete, unmodified IndexEntry JSON as received from the indexer. This column is the source of truth for any field not projected into a dedicated column. Projected columns exist solely for query performance; they are derived from `raw_entry` at ingest time and MUST NOT be modified independently.
+
+The `inline_content` column is populated only when `storage_mode` is `'inline'`. When `storage_mode` is `'vault'`, this column is `NULL`. The vault stores the bytes; the catalog stores the metadata. This column is the single exception to that rule, as defined by the hybrid storage routing contract ([§6.4](#64-hybrid-storage-routing)).
+
+The schema uses `TEXT` for the `id` column rather than a binary type because `id` values are hex-encoded hash strings in the IndexEntry contract and are frequently displayed, logged, and used in CLI output. Storing them as text avoids encode/decode overhead on every read path.
 
 ---
 
@@ -571,7 +703,7 @@ metadexer/
 | <span style="white-space: nowrap;">`.python-version`</span> | File | Contains the string `3.12` (no minor patch). Used by `pyenv` and similar version managers to auto-select the correct interpreter. |
 | <span style="white-space: nowrap;">`CHANGELOG.md`</span> | File | Project changelog following [Keep a Changelog](https://keepachangelog.com/) format. Documents all notable changes organized by release version. |
 | <span style="white-space: nowrap;">`CLAUDE.md`</span> | File | Project-level agent context file for Claude Code. Read automatically by Claude Code at session start. See [§23.6.1](#2361-agent-context-files) for required contents. |
-| <span style="white-space: nowrap;">`LICENSE`</span> | File | License text (license selection TBD). |
+| <span style="white-space: nowrap;">`LICENSE`</span> | File | Full Apache 2.0 license text, obtained from [https://www.apache.org/licenses/LICENSE-2.0.txt](https://www.apache.org/licenses/LICENSE-2.0.txt). |
 | <span style="white-space: nowrap;">`mkdocs.yml`</span> | File | MkDocs configuration for the documentation site. See [§11](#11-documentation-site). |
 | <span style="white-space: nowrap;">`pyproject.toml`</span> | File | Centralized project metadata, build system configuration, dependency declarations, entry points, and tool settings (`ruff`, `pytest`). |
 | <span style="white-space: nowrap;">`README.md`</span> | File | Project overview, installation instructions, quick-start usage examples, and links to full documentation. |
@@ -691,14 +823,14 @@ This navigation structure is intentionally minimal at the DRAFT stage. Additiona
 
 ### 11.3. Changelog Synchronization
 
-The documentation site's changelog page (`docs/changelog.md`) is a copy of `CHANGELOG.md` at the repository root. The copy is maintained manually. The file begins with a header comment identifying it as auto-copied:
+The documentation site's changelog page (`docs/changelog.md`) is a copy of `CHANGELOG.md` at the repository root. The canonical changelog is `CHANGELOG.md` at the repository root. All edits are made there. The file begins with a header comment identifying it as auto-copied:
 
 ```markdown
 <!-- THIS FILE IS AUTO-COPIED FROM CHANGELOG.md AT THE REPOSITORY ROOT. -->
 <!-- DO NOT EDIT THIS FILE DIRECTLY. Edit CHANGELOG.md instead. -->
 ```
 
-The canonical changelog is `CHANGELOG.md` at the repository root. All edits are made there. When the documentation site is built or deployed, `docs/changelog.md` MUST reflect the current state of `CHANGELOG.md`. If the two files diverge, the root `CHANGELOG.md` is authoritative.
+The docs CI workflow (`.github/workflows/docs.yml`) MUST execute `cp CHANGELOG.md docs/changelog.md` as a build step before invoking `mkdocs build`. This ensures the published site always reflects the current root changelog without requiring developers to remember a manual copy step. Local `mkdocs serve` usage assumes the developer has run this copy; the `venv-setup` scripts MAY include the copy as a convenience step.
 
 ### 11.4. Build and Preview
 
@@ -737,7 +869,7 @@ These packages are NOT required for using, developing, or testing metadexer. The
 
 ### 12.1. Command Structure
 
-The CLI uses `click` as the argument parser. The top-level command is `metadexer`. Subcommands map to module operations. The exact subcommand tree is defined during implementation, but the following structure reflects the expected shape:
+The CLI uses `click` as the argument parser. The top-level command is `metadexer`. Subcommands map to module operations:
 
 ```
 metadexer ingest <target>       # run the sync pipeline on a target directory or file
@@ -781,6 +913,76 @@ Configuration objects SHOULD be frozen (immutable) dataclasses. Unknown keys in 
 | <span style="white-space: nowrap;">Linux</span> | `$XDG_CONFIG_HOME/metadexer/` (default: `~/.config/metadexer/`) |
 | <span style="white-space: nowrap;">macOS</span> | `~/Library/Application Support/metadexer/` |
 
+### 13.3. Configuration Keys and Defaults
+
+The TOML configuration file mirrors the `MetadexerConfig` frozen dataclass structure. Top-level scalar fields are TOML key-value pairs. Nested structures become TOML tables. The following is a complete example showing every configurable field with its compiled default value. Most users will not need a configuration file at all; the defaults cover the common case.
+
+```toml
+# metadexer configuration
+# Place this file at:
+#   Linux:   ~/.config/metadexer/config.toml
+#   macOS:   ~/Library/Application Support/metadexer/config.toml
+#   Windows: %LOCALAPPDATA%\metadexer\config.toml
+# Or as .metadexer.toml in a project directory for project-local overrides.
+
+# ─── Vault ──────────────────────────────────────────────────────────────────
+
+[vault]
+backend = "local"                       # "local" or "s3"
+root = ""                               # Vault root path (required for local backend).
+                                        # Empty string means unset; must be provided by
+                                        # the user or project-local config before use.
+chunk_size_bytes = 8388608              # 8 MB. Used for chunked reads/writes and
+                                        # streaming hash computation.
+
+[vault.s3]
+endpoint_url = ""                       # S3-compatible endpoint URL.
+bucket = ""                             # Bucket name.
+prefix = ""                             # Optional key prefix within the bucket.
+region = ""                             # AWS region (if applicable).
+# Credentials are supplied via environment variables (AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY) or instance profiles. They are never stored in
+# this file. See §20.3.
+
+# ─── Catalog ────────────────────────────────────────────────────────────────
+
+[catalog]
+backend = "sqlite"                      # "sqlite" or "postgres"
+
+[catalog.sqlite]
+path = ""                               # Path to SQLite database file.
+                                        # Empty string means unset; defaults to
+                                        # <app_data_dir>/catalog.db when not provided.
+
+[catalog.postgres]
+# Connection parameters. The connection string is assembled from these fields
+# or supplied via the METADEXER_DATABASE_URL environment variable (which takes
+# precedence over individual fields). Credentials MUST be supplied via
+# environment variables, not stored here. See §20.3.
+host = "localhost"
+port = 5432
+dbname = "metadexer"
+# user and password: supplied via PGUSER/PGPASSWORD environment variables.
+
+# ─── Storage Routing ────────────────────────────────────────────────────────
+
+[storage_routing]
+inline_max_bytes = 65536                # 64 KB. Content at or below this size (and
+                                        # with an eligible MIME type) is stored inline
+                                        # in the catalog.
+inline_mime_prefixes = ["text/"]         # MIME type prefixes eligible for inline storage.
+inline_extra_types = ["application/json"] # Additional full MIME types eligible beyond
+                                        # the prefix list.
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+
+[logging]
+level = "INFO"                          # Root log level: DEBUG, INFO, WARNING, ERROR.
+file_enabled = false                    # Write persistent log files to <app_data_dir>/logs/.
+```
+
+Configuration keys not present in the user's TOML file retain their compiled default values. Unknown keys are silently ignored for forward compatibility.
+
 ---
 
 ## 14. File Encoding and JSON Conventions
@@ -811,7 +1013,13 @@ The full dependency inventory is defined during implementation in `pyproject.tom
 | `orjson` | High-performance JSON serialization | Optional (silent fallback to `json` stdlib) |
 | `psycopg` (or equivalent) | PostgreSQL database driver | Required for PostgreSQL backend |
 | `boto3` (or equivalent) | S3-compatible object storage client | Required for S3 backend |
-| `shruggie-indexer` | IndexEntry production | Required (invoked as subprocess or library) |
+| `shruggie-indexer` | IndexEntry production | Required (library import preferred; see below) |
+
+**shruggie-indexer invocation method.** The sync module invokes shruggie-indexer via Python library import as the primary method. The indexer's public API exposes `index_path()` ([shruggie-indexer spec §9.2](https://github.com/shruggietech/shruggie-indexer)), which accepts a `Path` and an optional `IndexerConfig` and returns a fully populated `IndexEntry`. This is the default invocation path when `shruggie-indexer` is installed as a Python package (i.e., `from shruggie_indexer import index_path` succeeds).
+
+When the library import is unavailable (e.g., standalone PyInstaller deployments where `shruggie-indexer` is a separate binary on `PATH` rather than an installed Python package), the sync module falls back to subprocess invocation: it calls the `shruggie-indexer` CLI with JSON output mode and parses the resulting IndexEntry JSON from `stdout`. The subprocess fallback produces identical IndexEntry records but incurs per-invocation process startup overhead.
+
+The invocation method is determined at runtime by attempting the library import first. If the import raises `ImportError`, the subprocess path is used. This decision is made once at sync module initialization and cached for the duration of the session. The configuration system does not expose a manual override for this behavior.
 
 ### 15.2. External Service Dependencies
 
@@ -858,6 +1066,105 @@ All tests run with a bare `pytest` invocation. `pyproject.toml` registers custom
 
 metadexer is **not published to PyPI**. End users download pre-built executables from GitHub Releases.
 
+### 18.1. pyproject.toml Configuration
+
+The complete `pyproject.toml` is the single configuration file for the build system, package metadata, dependency declarations, entry points, and tool settings. The following is the canonical content; an implementer SHOULD produce a file equivalent to this, though field ordering within tables may vary.
+
+```toml
+# ─── Build system ───────────────────────────────────────────────────────────
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ─── Package metadata ──────────────────────────────────────────────────────
+
+[project]
+name = "metadexer"
+description = "Content-addressed asset management with deep metadata search, hybrid storage routing, and temporal observation tracking"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{name = "William Thompson"}]
+keywords = ["asset-management", "content-addressed", "metadata", "indexer", "deduplication"]
+dynamic = ["version"]
+dependencies = [
+    "click>=8.1",
+    "orjson>=3.9",
+    "shruggie-indexer>=0.1.2",
+]
+
+[project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.1",
+]
+s3 = [
+    "boto3>=1.28",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.3",
+    "metadexer[postgres,s3]",
+]
+
+# ─── Entry points ──────────────────────────────────────────────────────────
+
+[project.scripts]
+metadexer = "metadexer.cli:main"
+
+# ─── Hatchling configuration ───────────────────────────────────────────────
+
+[tool.hatch.version]
+path = "src/metadexer/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/metadexer"]
+
+# ─── Pytest ────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "platform_windows: marks tests that only run on Windows",
+    "platform_linux: marks tests that only run on Linux",
+    "platform_macos: marks tests that only run on macOS",
+    "requires_postgres: marks tests that require a PostgreSQL instance",
+    "requires_s3: marks tests that require an S3-compatible endpoint",
+]
+
+# ─── Ruff ──────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific rules
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["metadexer"]
+```
+
+### 18.2. Build and Release Pipeline
+
 Packaging stack:
 
 - `pyproject.toml` as the single metadata and dependency declaration file.
@@ -866,7 +1173,25 @@ Packaging stack:
 
 Release pipeline stages: Checkout, Test, Build (PyInstaller), Rename artifacts (version + platform tags), Upload, Create GitHub Release.
 
-The version string lives in a single `_version.py` file. All other references derive from it. Versioning follows semantic versioning (`MAJOR.MINOR.PATCH`). Pre-release versions use suffixes like `-rc1`.
+### 18.3. Version Management
+
+The version string lives in a single `_version.py` file:
+
+```python
+# src/metadexer/_version.py
+__version__ = "0.1.0"
+```
+
+All other version consumers read from this file:
+
+| Consumer | Mechanism |
+|----------|-----------|
+| `pyproject.toml` | `[tool.hatch.version]` reads `__version__` from the file path `src/metadexer/_version.py`. Hatchling parses the file and extracts the version string at build time. |
+| `__init__.py` | `from metadexer._version import __version__` makes the version available as `metadexer.__version__` for library consumers. |
+| CLI `--version` flag | `@click.version_option(version=__version__)` reads the imported `__version__` attribute. |
+| PyInstaller artifacts | The build scripts extract the version from `_version.py` (via a shell `grep`/`sed` or Python one-liner) to construct versioned artifact filenames. |
+
+Versioning follows semantic versioning (`MAJOR.MINOR.PATCH`). Pre-release versions use PEP 440 format in `_version.py` (e.g., `0.1.0rc1`) and hyphenated form in git tags (e.g., `v0.1.0-rc1`). During the `0.x.y` series, minor version bumps MAY include breaking changes.
 
 ---
 
@@ -928,7 +1253,7 @@ The catalog schema MUST include appropriate indexes on commonly queried fields: 
 
 ### 21.3. Vault I/O Performance
 
-Vault operations use chunked I/O for all file reads and writes. The chunk size is configurable with a sensible default (e.g., 8 MB). For the S3 backend, multipart upload is used for objects exceeding the S3 single-upload size threshold. The local filesystem backend uses a directory sharding strategy (e.g., first N characters of `storage_name` as subdirectory prefixes) to prevent performance degradation from directories with millions of entries.
+Vault operations use chunked I/O for all file reads and writes. The chunk size is configurable with a sensible default (8 MB, per the `vault.chunk_size_bytes` configuration key in [§13.3](#133-configuration-keys-and-defaults)). For the S3 backend, multipart upload is used for objects exceeding the S3 single-upload size threshold. The local filesystem backend uses the two-character prefix sharding scheme defined in [§5.3](#53-storage-backends) to prevent performance degradation from directories with millions of entries.
 
 ---
 
@@ -1267,6 +1592,189 @@ Each file MAY include a brief preamble at the top with instructions specific to 
 
 **Synchronization rule:** When the admin layer updates one file, it MUST update the other in the same commit. The commit message for agent context updates is: `docs: update agent context files`.
 
+**Canonical file contents:**
+
+The following are the literal file contents to be committed to the repository. The shared core section is identical in both files; only the tool-specific preamble differs.
+
+**`CLAUDE.md`:**
+
+````markdown
+# CLAUDE.md — metadexer Agent Context
+
+> This file is read automatically by Claude Code at session start.
+> It provides persistent project-level context for all coding sessions.
+> Do not modify this file during coding sessions. Changes are made by
+> the admin layer only.
+
+## Project Identity
+
+- **Project:** metadexer
+- **Organization:** ShruggieTech LLC (https://shruggie.tech)
+- **Language:** Python 3.12+
+- **License:** Apache 2.0
+
+## Repository Structure
+
+```
+metadexer/
+├── .archive/           # Historical/retired documents
+├── .github/            # GitHub config, CI workflows, Copilot instructions
+├── .handoff/plans/     # Sprint documents and prompt templates (admin → coding)
+├── .handoff/reports/   # Session reports and test summaries (coding → admin)
+├── docs/               # MkDocs documentation site source
+├── scripts/            # Dev environment setup and build scripts
+├── src/metadexer/      # Python source package
+│   ├── cli.py          # CLI entry point (click)
+│   ├── vault/          # Content-addressed byte storage
+│   ├── catalog/        # Metadata registry, search, references
+│   └── sync/           # Ingestion pipeline orchestration
+├── tests/              # Test suites (unit/, integration/, conformance/, platform/)
+├── metadexer-spec.md   # Authoritative technical specification
+└── pyproject.toml      # Build config, dependencies, tool settings
+```
+
+## Specification Authority
+
+1. `metadexer-spec.md` (this repo) is authoritative for all metadexer behavior.
+2. `shruggie-indexer-spec.md` (shruggie-indexer repo) is authoritative for IndexEntry schema and indexer behavior.
+3. When any document conflicts with the specification, the specification wins.
+4. Sprint documents in `.handoff/plans/` define work scope. Do not exceed their scope.
+
+## Coding Conventions
+
+- UTF-8 without BOM. LF line endings. Enforced by `.gitattributes`.
+- `snake_case` for all Python identifiers (variables, functions, modules).
+- Import ordering: stdlib, then third-party, then local. Enforced by ruff isort.
+- Use `pathlib.Path` for all filesystem operations. No raw string path manipulation.
+- Use the standard `logging` module. Logger names follow package structure
+  (e.g., `metadexer.vault.store`).
+- Line length limit: 100 characters. Enforced by ruff.
+- Type hints on all public function signatures.
+
+## Testing Conventions
+
+- Run all tests: `pytest`
+- Strict markers enforced: `--strict-markers` is configured in `pyproject.toml`.
+- Tests organized by type: `tests/unit/`, `tests/integration/`, `tests/conformance/`, `tests/platform/`.
+- Platform-specific tests use markers: `@pytest.mark.platform_windows`, `@pytest.mark.platform_linux`, `@pytest.mark.platform_macos`.
+- Backend-specific tests use markers: `@pytest.mark.requires_postgres`, `@pytest.mark.requires_s3`.
+
+## CLI Conventions
+
+- Framework: `click` (argument parsing and subcommand routing).
+- `stdout` is reserved for structured output (JSON). All diagnostics go to `stderr`.
+- Destructive operations require explicit opt-in flags. `--dry-run` is default for prune.
+- The CLI is a thin layer over the module APIs. No business logic in `cli.py`.
+
+## Prohibitions
+
+- **No silent data loss.** Never delete or overwrite content without explicit user confirmation.
+- **No implicit deletion.** All deletion is two-phase (reference removal, then explicit prune).
+- **No identity recomputation.** Content identity is produced by shruggie-indexer only.
+  metadexer preserves, records, and propagates it.
+- **No architectural decisions.** Do not redefine module boundaries, invent new modules,
+  or change the component map without admin layer authorization.
+- **No scope creep.** Implement exactly what the sprint document specifies. File observations
+  about potential improvements in the session report, do not act on them.
+- **No platform-conditional logic in core modules.** `vault/`, `catalog/`, and `sync/`
+  must not contain `if sys.platform` or `if os.name` branches.
+
+## Commit Conventions
+
+- Pattern: `<module>: <imperative description>` (e.g., `vault: implement put operation for local backend`)
+- One logical change per commit. Do not bundle unrelated changes.
+- Sprint reference in body (optional): `Sprint: 20260310-001, Item 3`
+````
+
+**`.github/copilot-instructions.md`:**
+
+````markdown
+# Copilot Instructions — metadexer
+
+<!-- This file is read automatically by GitHub Copilot in VS Code. -->
+<!-- It provides persistent project-level context for code suggestions. -->
+<!-- Do not modify during coding sessions. Admin layer manages this file. -->
+
+## Project Identity
+
+- **Project:** metadexer
+- **Organization:** ShruggieTech LLC (https://shruggie.tech)
+- **Language:** Python 3.12+
+- **License:** Apache 2.0
+
+## Repository Structure
+
+```
+metadexer/
+├── .archive/           # Historical/retired documents
+├── .github/            # GitHub config, CI workflows, Copilot instructions
+├── .handoff/plans/     # Sprint documents and prompt templates (admin → coding)
+├── .handoff/reports/   # Session reports and test summaries (coding → admin)
+├── docs/               # MkDocs documentation site source
+├── scripts/            # Dev environment setup and build scripts
+├── src/metadexer/      # Python source package
+│   ├── cli.py          # CLI entry point (click)
+│   ├── vault/          # Content-addressed byte storage
+│   ├── catalog/        # Metadata registry, search, references
+│   └── sync/           # Ingestion pipeline orchestration
+├── tests/              # Test suites (unit/, integration/, conformance/, platform/)
+├── metadexer-spec.md   # Authoritative technical specification
+└── pyproject.toml      # Build config, dependencies, tool settings
+```
+
+## Specification Authority
+
+1. `metadexer-spec.md` (this repo) is authoritative for all metadexer behavior.
+2. `shruggie-indexer-spec.md` (shruggie-indexer repo) is authoritative for IndexEntry schema and indexer behavior.
+3. When any document conflicts with the specification, the specification wins.
+4. Sprint documents in `.handoff/plans/` define work scope. Do not exceed their scope.
+
+## Coding Conventions
+
+- UTF-8 without BOM. LF line endings. Enforced by `.gitattributes`.
+- `snake_case` for all Python identifiers (variables, functions, modules).
+- Import ordering: stdlib, then third-party, then local. Enforced by ruff isort.
+- Use `pathlib.Path` for all filesystem operations. No raw string path manipulation.
+- Use the standard `logging` module. Logger names follow package structure
+  (e.g., `metadexer.vault.store`).
+- Line length limit: 100 characters. Enforced by ruff.
+- Type hints on all public function signatures.
+
+## Testing Conventions
+
+- Run all tests: `pytest`
+- Strict markers enforced: `--strict-markers` is configured in `pyproject.toml`.
+- Tests organized by type: `tests/unit/`, `tests/integration/`, `tests/conformance/`, `tests/platform/`.
+- Platform-specific tests use markers: `@pytest.mark.platform_windows`, `@pytest.mark.platform_linux`, `@pytest.mark.platform_macos`.
+- Backend-specific tests use markers: `@pytest.mark.requires_postgres`, `@pytest.mark.requires_s3`.
+
+## CLI Conventions
+
+- Framework: `click` (argument parsing and subcommand routing).
+- `stdout` is reserved for structured output (JSON). All diagnostics go to `stderr`.
+- Destructive operations require explicit opt-in flags. `--dry-run` is default for prune.
+- The CLI is a thin layer over the module APIs. No business logic in `cli.py`.
+
+## Prohibitions
+
+- **No silent data loss.** Never delete or overwrite content without explicit user confirmation.
+- **No implicit deletion.** All deletion is two-phase (reference removal, then explicit prune).
+- **No identity recomputation.** Content identity is produced by shruggie-indexer only.
+  metadexer preserves, records, and propagates it.
+- **No architectural decisions.** Do not redefine module boundaries, invent new modules,
+  or change the component map without admin layer authorization.
+- **No scope creep.** Implement exactly what the sprint document specifies. File observations
+  about potential improvements in the session report, do not act on them.
+- **No platform-conditional logic in core modules.** `vault/`, `catalog/`, and `sync/`
+  must not contain `if sys.platform` or `if os.name` branches.
+
+## Commit Conventions
+
+- Pattern: `<module>: <imperative description>` (e.g., `vault: implement put operation for local backend`)
+- One logical change per commit. Do not bundle unrelated changes.
+- Sprint reference in body (optional): `Sprint: 20260310-001, Item 3`
+````
+
 #### 23.6.2. Sprint Document as Agent Context
 
 When executing a work item, the coding agent's context MUST include:
@@ -1430,3 +1938,4 @@ None of these capabilities require redefining content identity. The IndexEntry c
 |------|---------|--------|
 | <span style="white-space: nowrap;">2026-03-07</span> | DRAFT | Initial specification. Derived from the metadexer high-level overview (`20260305-004-metadexer-overview.md`). Establishes architectural contracts, module responsibilities, invariants, and development phasing sufficient for sprint planning. |
 | <span style="white-space: nowrap;">2026-03-09</span> | DRAFT | Merged the standalone development workflow document (`metadexer-development-workflow.md`, dated 2026-03-08) into the specification as §23. Expanded handoff protocol with concrete artifact formats, session report schema, and agent session transcript preservation guidance. Introduced `.handoff/plans/` and `.handoff/reports/` directory structure, replacing the prior use of `.archive/` as the handoff location. `.archive/` is retained for historical document storage only. Added `CLAUDE.md` and `.github/copilot-instructions.md` as defined agent context files with synchronization requirements. Updated repository structure (§10) to reflect new directories and files. Added workflow-related terms to the terminology table (§1.5). Renumbered §23 (Composition Rules) to §24 and §24 (Future Considerations) to §25. |
+| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 1 gap resolution pass. Added catalog database schema for PostgreSQL and SQLite (§6.7). Added canonical `pyproject.toml` configuration (§18.1) and version management details (§18.3). Added literal agent context file contents for `CLAUDE.md` and `.github/copilot-instructions.md` (§23.6.1). Added configuration TOML structure with all Phase 2 keys and defaults (§13.3). Added default storage routing thresholds and ruleset (§6.4). Specified vault local backend directory layout with two-character prefix sharding (§5.3). Defined shruggie-indexer invocation method as library-first with subprocess fallback (§15.1). Clarified vault `get` operation accepts `storage_name` only, not `id` (§5.2). Resolved license field contradiction in §10.1. Removed hedging language from CLI subcommand tree (§12.1). Specified changelog copy automation as a docs CI build step (§11.3). Updated §21.3 to reference concrete sharding and chunk size specifications. |
