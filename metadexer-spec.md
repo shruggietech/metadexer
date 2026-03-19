@@ -693,7 +693,7 @@ metadexer/
 | <span style="white-space: nowrap;">`.archive/`</span> | Directory | Historical storage for completed, superseded, or retired project documents. Not part of the active handoff flow. Documents that were once active in `.handoff/plans/` MAY be moved here after their associated sprint is complete and integrated. Files follow the standard ShruggieTech naming convention: `<YYYYmmdd>-<ZZZ>-<title>.<ext>`, where `ZZZ` is a three-digit zero-padded increment that resets to `001` on each new date. |
 | <span style="white-space: nowrap;">`.github/`</span> | Directory | GitHub-specific repository configuration. Contains `copilot-instructions.md` (project-level AI coding guidelines for GitHub Copilot) and `workflows/` with CI/CD pipeline definitions: `release.yml` for the release build pipeline ([§18](#18-packaging-and-distribution)) and `docs.yml` for automated documentation site deployment to GitHub Pages ([§11](#11-documentation-site)). |
 | <span style="white-space: nowrap;">`.handoff/`</span> | Directory | Bidirectional handoff location for artifacts exchanged between the admin layer and coding layer. See [§23.3](#233-handoff-protocol) for the full handoff protocol. |
-| <span style="white-space: nowrap;">`.handoff/plans/`</span> | Directory | Admin-to-coding handoff. Contains sprint planning documents, session prompt templates (`_TEMPLATE.txt`), and any other artifacts the admin layer produces for consumption by the coding layer. Files follow the same date-scoped naming convention as `.archive/`. |
+| <span style="white-space: nowrap;">`.handoff/plans/`</span> | Directory | Admin-to-coding handoff. Contains sprint planning documents and any other artifacts the admin layer produces for consumption by the coding layer. Files follow the same date-scoped naming convention as `.archive/`. |
 | <span style="white-space: nowrap;">`.handoff/reports/`</span> | Directory | Coding-to-admin handoff. Contains session reports, test result summaries, and other artifacts produced by (or on behalf of) the coding layer for consumption by the admin layer. See [§23.3.4](#2334-session-report-format) for the required report format. |
 | <span style="white-space: nowrap;">`docs/`</span> | Directory | All project documentation for the MkDocs-based documentation site. See [§10.3](#103-documentation-artifacts). |
 | <span style="white-space: nowrap;">`scripts/`</span> | Directory | Platform-paired shell scripts for development environment setup and build automation. See [§10.4](#104-scripts-and-build-tooling). |
@@ -1329,7 +1329,6 @@ The admin layer is responsible for strategic direction, specification authoring,
 |----------|-------------|-------------|
 | Technical specifications | `metadexer-spec.md`, `shruggie-indexer-spec.md`. The authoritative source of truth for all architectural and behavioral decisions. | Repository root |
 | Sprint planning documents | Structured work item definitions following the five-section format from the metadexer overview (Appendix D): header block, purpose and context, implementation ordering, work item sections, and specification update directive. | `.handoff/plans/` |
-| Session prompt templates | `_TEMPLATE.txt` files paired with sprint documents. Contain the initial prompt text to be fed to coding agents at session start. | `.handoff/plans/` (same increment as paired sprint doc) |
 | Agent context files | `CLAUDE.md` and `.github/copilot-instructions.md`. Persistent project-level context consumed by AI coding agents. See [§23.6.1](#2361-agent-context-files). | Repository root and `.github/` respectively |
 | Workflow updates | Updates to this specification's [§23](#23-development-workflow) section when process changes are needed. | Repository root (within `metadexer-spec.md`) |
 
@@ -1368,11 +1367,11 @@ The handoff protocol is the critical integration point between layers. All task 
 
 ```
 .handoff/
-├── plans/        # Admin → Coding (sprint docs, templates)
+├── plans/        # Admin → Coding (sprint docs)
 └── reports/      # Coding → Admin (session reports, test summaries)
 ```
 
-Both subdirectories use the standard ShruggieTech naming convention: `<YYYYmmdd>-<ZZZ>-<title>.<ext>`, where `ZZZ` is a three-digit zero-padded increment that resets to `001` on each new date. Related artifacts (e.g., a sprint document and its paired template) share the same date and increment value.
+Both subdirectories use the standard ShruggieTech naming convention: `<YYYYmmdd>-<ZZZ>-<title>.<ext>`, where `ZZZ` is a three-digit zero-padded increment that resets to `001` on each new date.
 
 The `.handoff/` directory is tracked in version control. All artifacts committed here become part of the project's permanent record. When a sprint is fully complete and its reports have been reviewed, the associated plan and report files MAY be moved to `.archive/` to keep `.handoff/` focused on active or recent work.
 
@@ -1390,12 +1389,10 @@ The admin layer produces the following artifacts and commits them to `.handoff/p
 
 Each work item section MUST be written so that an AI coding agent can execute it within a single context window, without interactive clarification. If a work item requires more context than fits in a single window, it MUST be decomposed into smaller items.
 
-**Session prompt template.** A `_TEMPLATE.txt` file paired with the sprint document (same date and increment). This file contains the literal text to be pasted into a coding agent's initial prompt. It typically includes: a one-paragraph context summary, the path to the sprint document, the specific work item number(s) to execute, and any special instructions (e.g., "verify against PostgreSQL backend only").
-
 **Procedure:**
 
-1. The admin layer authors the sprint document and template.
-2. Both files are committed to `.handoff/plans/` with the message: `workflow: add sprint <YYYYMMDD>-<ZZZ>`.
+1. The admin layer authors the sprint document.
+2. The sprint document is committed to `.handoff/plans/` with the message: `workflow: add sprint <YYYYMMDD>-<ZZZ>`.
 3. The project lead pushes the commit to `main` (or merges it if authored on a branch).
 4. The coding layer pulls `main` and reads the sprint document to initiate work.
 
@@ -1782,8 +1779,7 @@ When executing a work item, the coding agent's context MUST include:
 1. The agent context file (`CLAUDE.md` or equivalent) -- always.
 2. The specific work item section from the sprint document -- always.
 3. The authoritative specification for the component being modified -- always.
-4. The `_TEMPLATE.txt` prompt file, if one is paired with the sprint document -- when available.
-5. Any referenced prior sprint documents or changelogs -- only when the work item explicitly depends on prior work.
+4. Any referenced prior sprint documents or changelogs -- only when the work item explicitly depends on prior work.
 
 Agents MUST NOT be given the entire sprint document if they are only executing one work item. Unnecessary context degrades agent performance and increases cost.
 
@@ -1887,7 +1883,7 @@ The following sequence describes one complete development cycle from planning th
 
 1. **Admin layer** reviews the current state of the project (recent commits, test results, session reports in `.handoff/reports/`).
 2. **Admin layer** authors a sprint document defining the next batch of work items. The document follows the five-section structure.
-3. **Admin layer** commits the sprint document and its `_TEMPLATE.txt` to `.handoff/plans/`.
+3. **Admin layer** commits the sprint document to `.handoff/plans/`.
 4. **Project lead** reviews the sprint document's work items and determines the execution mode:
    - If all items are sequential dependencies: use Sequential Mode ([§23.4.1](#2341-sequential-mode)).
    - If some items are independent: use Parallel Independent Mode ([§23.4.2](#2342-parallel-independent-mode)) for independent items, Sequential Mode for dependent items.
@@ -1939,3 +1935,4 @@ None of these capabilities require redefining content identity. The IndexEntry c
 | <span style="white-space: nowrap;">2026-03-07</span> | DRAFT | Initial specification. Derived from the metadexer high-level overview (`20260305-004-metadexer-overview.md`). Establishes architectural contracts, module responsibilities, invariants, and development phasing sufficient for sprint planning. |
 | <span style="white-space: nowrap;">2026-03-09</span> | DRAFT | Merged the standalone development workflow document (`metadexer-development-workflow.md`, dated 2026-03-08) into the specification as §23. Expanded handoff protocol with concrete artifact formats, session report schema, and agent session transcript preservation guidance. Introduced `.handoff/plans/` and `.handoff/reports/` directory structure, replacing the prior use of `.archive/` as the handoff location. `.archive/` is retained for historical document storage only. Added `CLAUDE.md` and `.github/copilot-instructions.md` as defined agent context files with synchronization requirements. Updated repository structure (§10) to reflect new directories and files. Added workflow-related terms to the terminology table (§1.5). Renumbered §23 (Composition Rules) to §24 and §24 (Future Considerations) to §25. |
 | <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 1 gap resolution pass. Added catalog database schema for PostgreSQL and SQLite (§6.7). Added canonical `pyproject.toml` configuration (§18.1) and version management details (§18.3). Added literal agent context file contents for `CLAUDE.md` and `.github/copilot-instructions.md` (§23.6.1). Added configuration TOML structure with all Phase 2 keys and defaults (§13.3). Added default storage routing thresholds and ruleset (§6.4). Specified vault local backend directory layout with two-character prefix sharding (§5.3). Defined shruggie-indexer invocation method as library-first with subprocess fallback (§15.1). Clarified vault `get` operation accepts `storage_name` only, not `id` (§5.2). Resolved license field contradiction in §10.1. Removed hedging language from CLI subcommand tree (§12.1). Specified changelog copy automation as a docs CI build step (§11.3). Updated §21.3 to reference concrete sharding and chunk size specifications. |
+| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Retired `_TEMPLATE.txt` session prompt template convention from §23. Sprint documents are the sole admin-to-coding handoff artifact. Removed template references from §10.1, §23.2.1, §23.3.1, §23.3.2, §23.6.2, and §23.9. |
