@@ -1,0 +1,10 @@
+# Placeholder: Release build pipeline.
+# Specification reference: metadexer-spec.md §18.2 (Build and Release Pipeline).
+# Implementation deferred until packaging work begins.
+name: release
+on: workflow_dispatch
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Placeholder"

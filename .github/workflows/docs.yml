@@ -1,0 +1,11 @@
+# Placeholder: Documentation site deployment workflow.
+# Specification reference: metadexer-spec.md §11.5 (Deployment).
+# Implementation deferred until the documentation site has content
+# worth deploying (post-Sprint 1).
+name: docs
+on: workflow_dispatch
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Placeholder"
