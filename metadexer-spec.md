@@ -44,16 +44,18 @@
   - [5.1. Purpose](#51-purpose)
   - [5.2. Operations](#52-operations)
   - [5.3. Storage Backends](#53-storage-backends)
-  - [5.4. Invariants](#54-invariants)
-  - [5.5. Verification Modes](#55-verification-modes)
+  - [5.4. Backend Interface](#54-backend-interface)
+  - [5.5. Invariants](#55-invariants)
+  - [5.6. Verification Modes](#56-verification-modes)
 - [6. Catalog Module](#6-catalog-module)
   - [6.1. Purpose](#61-purpose)
   - [6.2. Operations](#62-operations)
   - [6.3. Database Backends](#63-database-backends)
-  - [6.4. Hybrid Storage Routing](#64-hybrid-storage-routing)
-  - [6.5. Catalog-Indexer Contract](#65-catalog-indexer-contract)
-  - [6.6. Invariants](#66-invariants)
-  - [6.7. Catalog Database Schema](#67-catalog-database-schema)
+  - [6.4. Backend Interface](#64-backend-interface)
+  - [6.5. Hybrid Storage Routing](#65-hybrid-storage-routing)
+  - [6.6. Catalog-Indexer Contract](#66-catalog-indexer-contract)
+  - [6.7. Invariants](#67-invariants)
+  - [6.8. Catalog Database Schema](#68-catalog-database-schema)
 - [7. Sync Module](#7-sync-module)
   - [7.1. Purpose](#71-purpose)
   - [7.2. Pipeline Stages](#72-pipeline-stages)
@@ -65,6 +67,7 @@
 - [9. Failure Model](#9-failure-model)
   - [9.1. Tolerated Failure Modes](#91-tolerated-failure-modes)
   - [9.2. Recovery Principles](#92-recovery-principles)
+  - [9.3. Exception Hierarchy](#93-exception-hierarchy)
 - [10. Repository Structure](#10-repository-structure)
   - [10.1. Top-Level Layout](#101-top-level-layout)
   - [10.2. Source Package Layout](#102-source-package-layout)
@@ -388,7 +391,7 @@ The vault module provides content-addressed byte storage. It preserves raw file 
 | Operation | Description |
 |-----------|-------------|
 | <span style="white-space: nowrap;">**put**</span> | Store bytes under the `storage_name` key. Write-once: if the key already exists with identical content, the operation is a no-op. If the key exists with different content, this is a hash collision and MUST be surfaced as an error. |
-| <span style="white-space: nowrap;">**get**</span> | Retrieve bytes by `storage_name`. The vault does not resolve `id` to `storage_name`; that mapping is the caller's responsibility (typically resolved via a catalog lookup). This preserves the vault's "no catalog knowledge" invariant ([§5.4](#54-invariants)). |
+| <span style="white-space: nowrap;">**get**</span> | Retrieve bytes by `storage_name`. The vault does not resolve `id` to `storage_name`; that mapping is the caller's responsibility (typically resolved via a catalog lookup). This preserves the vault's "no catalog knowledge" invariant ([§5.5](#55-invariants)). |
 | <span style="white-space: nowrap;">**head**</span> | Check existence of an object without retrieving its bytes. |
 | <span style="white-space: nowrap;">**verify**</span> | Re-hash stored bytes and compare against a provided IndexEntry. Verification is always explicit, never triggered automatically during ingest. |
 | <span style="white-space: nowrap;">**prune**</span> | Remove unreferenced objects. Pruning is always explicit, never triggered automatically. Requires reconciliation against the catalog to determine which objects are unreferenced. |
@@ -413,7 +416,209 @@ The prefix is always the first two characters of `storage_name`, lowercased. Thi
 
 The local backend is the first implementation target. The S3 backend is the second.
 
-### 5.4. Invariants
+### 5.4. Backend Interface
+
+The vault module separates I/O operations from coordination logic. Backend classes (`vault/backends/local.py`, `vault/backends/s3.py`) implement a common abstract interface that handles raw byte storage and retrieval. The facade class (`vault/store.py`) consumes a backend instance and adds deduplication logic, hash verification, and prune orchestration.
+
+#### 5.4.1. VaultBackend Abstract Base Class
+
+Defined in `vault/backends/__init__.py`. All vault backends implement this interface.
+
+```python
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import AbstractContextManager
+from pathlib import Path
+from typing import BinaryIO
+
+
+class VaultBackend(ABC):
+    """Abstract interface for vault storage backends."""
+
+    @abstractmethod
+    def put(self, storage_name: str, source: Path) -> None:
+        """Write bytes from source file into the backend under storage_name.
+
+        The caller (VaultStore) guarantees that storage_name does not already
+        exist in this backend before calling put. Implementations MUST NOT
+        perform their own existence checks. Implementations MUST validate
+        that storage_name conforms to the expected key pattern (§20.1)
+        before performing any I/O.
+        """
+
+    @abstractmethod
+    def get(self, storage_name: str, destination: Path) -> None:
+        """Copy stored bytes for storage_name to the destination path.
+
+        Raises VaultObjectNotFoundError if storage_name does not exist.
+        Implementations MUST use chunked I/O (§20.4). The chunk size is
+        provided to the backend at construction time.
+        """
+
+    @abstractmethod
+    def head(self, storage_name: str) -> bool:
+        """Return True if storage_name exists in this backend, False otherwise."""
+
+    @abstractmethod
+    def delete(self, storage_name: str) -> None:
+        """Remove the object identified by storage_name.
+
+        Raises VaultObjectNotFoundError if storage_name does not exist.
+        This method is called by VaultStore.prune for each unreferenced
+        object. Backends MUST NOT perform cascade deletions or remove
+        anything other than the single named object.
+        """
+
+    @abstractmethod
+    def open_read(self, storage_name: str) -> AbstractContextManager[BinaryIO]:
+        """Return a context manager that yields a binary readable stream.
+
+        Usage:
+            with backend.open_read("a1b2c3d4.mp4") as f:
+                chunk = f.read(chunk_size)
+
+        Used by VaultStore.verify to stream bytes through hash computation
+        without writing to an intermediate file. Raises VaultObjectNotFoundError
+        if storage_name does not exist.
+        """
+
+    @abstractmethod
+    def iter_storage_names(self) -> Iterator[str]:
+        """Yield every storage_name present in this backend.
+
+        Used by catalog reconciliation to compare vault contents against
+        catalog records. Implementations SHOULD yield names in a stable
+        order (lexicographic) but callers MUST NOT depend on ordering.
+        """
+```
+
+Backend constructors receive configuration values specific to their storage type. The local backend constructor accepts `root: Path` and `chunk_size: int`. The S3 backend constructor accepts `endpoint_url: str`, `bucket: str`, `prefix: str`, `region: str`, and `chunk_size: int`. All values originate from the `[vault]` and `[vault.s3]` configuration tables ([§13.3](#133-configuration-keys-and-defaults)). Credential resolution for the S3 backend follows the rules in [§20.3](#203-credential-and-secret-handling).
+
+#### 5.4.2. VaultStore Facade
+
+Defined in `vault/store.py`. This is the public API that the sync module, CLI, and any future consumers call. It delegates I/O to a `VaultBackend` instance and implements the module-level operations defined in [§5.2](#52-operations).
+
+```python
+from pathlib import Path
+
+
+class VaultStore:
+    """Vault module public API. Wraps a VaultBackend with coordination logic."""
+
+    def __init__(self, backend: VaultBackend, chunk_size: int = 8_388_608) -> None:
+        """Initialize with a configured backend and chunk size for hash I/O.
+
+        The chunk_size parameter controls the buffer size used during
+        streaming hash computation in verify(). It defaults to 8 MB,
+        matching the vault.chunk_size_bytes configuration default.
+        """
+
+    def put(self, storage_name: str, source: Path) -> bool:
+        """Store bytes from source under storage_name (§5.2, put).
+
+        Deduplication logic:
+        1. Call backend.head(storage_name).
+        2. If the object already exists, return False (no-op).
+        3. If the object does not exist, call backend.put(storage_name, source)
+           and return True.
+
+        Returns True if bytes were written (new object), False if the object
+        already existed (deduplicated). Hash collision detection is not
+        performed during put; it is deferred to explicit verify() calls.
+        This is consistent with the invariant that verification is never
+        triggered automatically during ingest (§5.5).
+        """
+
+    def get(self, storage_name: str, destination: Path) -> None:
+        """Retrieve bytes to destination (§5.2, get).
+
+        Delegates directly to backend.get(). Raises VaultObjectNotFoundError
+        if the object does not exist.
+        """
+
+    def head(self, storage_name: str) -> bool:
+        """Check existence without retrieving bytes (§5.2, head).
+
+        Delegates directly to backend.head().
+        """
+
+    def verify(
+        self,
+        storage_name: str,
+        expected_hashes: dict[str, str],
+    ) -> "VerifyResult":
+        """Re-hash stored bytes and compare against expected hashes (§5.2, verify).
+
+        Procedure:
+        1. Open a streaming read via backend.open_read(storage_name).
+        2. Read in chunks of chunk_size bytes.
+        3. Feed each chunk into hashlib instances for every algorithm present
+           in expected_hashes (at minimum md5 and sha256; sha512 if provided).
+        4. Compare computed hex digests against expected_hashes values.
+        5. Return a VerifyResult indicating pass/fail and per-algorithm details.
+
+        The expected_hashes dict maps algorithm names to uppercase hex digest
+        strings, matching the IndexEntry hashes field convention. Example:
+        {"md5": "A1B2C3...", "sha256": "D4E5F6..."}.
+
+        Raises VaultObjectNotFoundError if storage_name does not exist.
+        """
+
+    def prune(
+        self,
+        unreferenced: set[str],
+        *,
+        dry_run: bool = True,
+    ) -> "PruneResult":
+        """Remove unreferenced objects from the vault (§5.2, prune).
+
+        The unreferenced set contains storage_names that the catalog has
+        determined are no longer referenced. This set is produced by the
+        catalog reconciliation operation (§6.2), not by the vault itself.
+
+        When dry_run is True (the default, per §20.2), no objects are
+        deleted; the PruneResult reports what would be removed. When
+        dry_run is False, backend.delete() is called for each name in
+        the unreferenced set.
+
+        Deletion failures for individual objects are recorded in the result
+        but do not abort the prune operation. The operation continues with
+        the remaining objects.
+        """
+```
+
+#### 5.4.3. Result Types
+
+Defined in `vault/store.py` alongside `VaultStore`. Both are frozen dataclasses.
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    """Result of a single-object vault verification."""
+
+    storage_name: str
+    passed: bool
+    checked: dict[str, bool]    # algorithm name -> matched (True/False)
+    expected: dict[str, str]    # algorithm name -> expected hex digest
+    actual: dict[str, str]      # algorithm name -> computed hex digest
+
+
+@dataclass(frozen=True)
+class PruneResult:
+    """Result of a vault prune operation."""
+
+    deleted: int                     # count of objects successfully removed
+    failed: int                      # count of objects where deletion failed
+    dry_run: bool                    # True if no objects were actually removed
+    storage_names: tuple[str, ...]   # names that were (or would be) removed
+```
+
+`VerifyResult.passed` is `True` only when every algorithm in `checked` reports `True`. If any single hash mismatches, `passed` is `False`. A hash mismatch on a previously stored object indicates either data corruption or (extremely rarely) a hash collision, and MUST be surfaced to the user as an error by the calling code.
+
+### 5.5. Invariants
 
 - The same `storage_name` always maps to identical bytes (write-once guarantee).
 - The vault enforces identity; it does not compute it.
@@ -421,7 +626,7 @@ The local backend is the first implementation target. The S3 backend is the seco
 - Pruning is always explicit. The vault never autonomously deletes content.
 - The vault module has no knowledge of catalog references, collections, or search. It stores and retrieves bytes.
 
-### 5.5. Verification Modes
+### 5.6. Verification Modes
 
 | Mode | Description |
 |------|-------------|
@@ -455,7 +660,290 @@ The catalog module is the metadata registry and search engine. It records and in
 
 **SQLite** is a lightweight alternative for quick evaluation, portable single-file deployments, and casual use. It is fully functional but not optimized for the concurrent access patterns or query complexity that arise at scale.
 
-### 6.4. Hybrid Storage Routing
+### 6.4. Backend Interface
+
+The catalog module separates database operations from business logic. Backend classes (`catalog/backends/sqlite.py`, `catalog/backends/postgres.py`) implement a common abstract interface that handles schema initialization, asset persistence, and query execution. The facade classes (`catalog/ingest.py`, `catalog/search.py`) consume a backend instance and add IndexEntry field projection, storage routing awareness, and query construction.
+
+#### 6.4.1. CatalogBackend Abstract Base Class
+
+Defined in `catalog/backends/__init__.py`. All catalog backends implement this interface.
+
+```python
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
+
+
+class CatalogBackend(ABC):
+    """Abstract interface for catalog database backends."""
+
+    @abstractmethod
+    def initialize_schema(self) -> None:
+        """Create the assets table, indexes, triggers, and (for SQLite)
+        the FTS5 virtual table if they do not already exist.
+
+        Implementations MUST be idempotent: calling this method on a
+        database that already has the schema is a no-op. The SQL
+        statements use CREATE TABLE IF NOT EXISTS (and equivalents)
+        to achieve this.
+        """
+
+    @abstractmethod
+    def upsert_asset(self, record: "AssetRecord") -> bool:
+        """Insert an asset record or silently skip if the id already exists.
+
+        Returns True if a new row was inserted, False if the id already
+        existed (duplicate ingest). This implements the idempotent ingest
+        contract from §6.2. Implementations MUST NOT update existing rows
+        on duplicate id; the original record is preserved.
+
+        The backend is responsible for serializing record.raw_entry to the
+        appropriate column type (JSONB for PostgreSQL, TEXT for SQLite)
+        and converting datetime fields to the backend's native format.
+        """
+
+    @abstractmethod
+    def get_by_id(self, asset_id: str) -> "AssetRecord | None":
+        """Return the asset with the given id, or None if not found.
+
+        Returns a fully populated AssetRecord with raw_entry deserialized
+        to a dict.
+        """
+
+    @abstractmethod
+    def get_by_storage_name(self, storage_name: str) -> "AssetRecord | None":
+        """Return the asset with the given storage_name, or None if not found.
+
+        Used by the sync module to resolve vault keys back to catalog entries.
+        """
+
+    @abstractmethod
+    def search(self, query: "SearchQuery") -> "SearchResult":
+        """Execute a search against the assets table.
+
+        The backend translates the SearchQuery into native SQL. Full-text
+        search uses PostgreSQL tsvector/tsquery or SQLite FTS5 as
+        appropriate. Filtering, pagination, and result counting are
+        handled by the backend.
+
+        Backends MUST return SearchResult.total as the count of all
+        matching rows (ignoring limit/offset) to support pagination.
+        """
+
+    @abstractmethod
+    def count(self) -> int:
+        """Return the total number of assets in the catalog."""
+
+    @abstractmethod
+    def iter_all_storage_names(self) -> Iterator[str]:
+        """Yield every storage_name in the assets table.
+
+        Used by catalog reconciliation (Phase 4) to compare catalog
+        contents against vault contents. Implementations SHOULD use
+        a server-side cursor or equivalent to avoid loading the full
+        result set into memory.
+        """
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release database connections and associated resources.
+
+        Implementations MUST be safe to call multiple times.
+        """
+```
+
+Backend constructors receive configuration values specific to their database type. The PostgreSQL backend constructor accepts `host: str`, `port: int`, `dbname: str`, and optional connection parameters. Credentials are resolved from environment variables (`PGUSER`, `PGPASSWORD`, or `METADEXER_DATABASE_URL`) per [§20.3](#203-credential-and-secret-handling). The SQLite backend constructor accepts `path: Path` for the database file location. All values originate from the `[catalog]`, `[catalog.postgres]`, and `[catalog.sqlite]` configuration tables ([§13.3](#133-configuration-keys-and-defaults)).
+
+#### 6.4.2. Catalog Facade Classes
+
+The catalog's public API is split across two files, reflecting the separation between write-path and read-path operations. Both classes receive the same `CatalogBackend` instance.
+
+**CatalogIngestor** (defined in `catalog/ingest.py`):
+
+```python
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+class CatalogIngestor:
+    """Catalog write-path API. Projects IndexEntry fields and persists assets."""
+
+    def __init__(self, backend: CatalogBackend) -> None:
+        """Initialize with a configured catalog backend."""
+
+    def ingest(
+        self,
+        raw_entry: dict,
+        storage_mode: str,
+        inline_content: str | None = None,
+    ) -> bool:
+        """Ingest a single IndexEntry into the catalog.
+
+        Parameters:
+            raw_entry: The complete IndexEntry as a Python dict, exactly
+                as produced by shruggie-indexer. This dict is stored
+                verbatim in the raw_entry column.
+            storage_mode: "vault" or "inline". Determined by the sync
+                module's storage routing logic (§6.5), not by this method.
+            inline_content: The file content as a UTF-8 string. Required
+                when storage_mode is "inline", must be None when
+                storage_mode is "vault".
+
+        Procedure:
+        1. Validate schema_version == 2.
+        2. Project IndexEntry fields into an AssetRecord:
+           - id, schema_version, type from top-level fields.
+           - mime_type from top-level field (may be None).
+           - extension from top-level field (may be None).
+           - name_text from raw_entry["name"]["text"].
+           - name_normalized from raw_entry["name"]["text"], lowercased.
+           - size_bytes from raw_entry["size"]["bytes"].
+           - ts_modified from raw_entry["timestamps"]["modified"]["iso"].
+           - ts_created from raw_entry["timestamps"]["created"]["iso"].
+           - storage_name from raw_entry["attributes"]["storage_name"].
+           - storage_mode and inline_content from parameters.
+           - ingested_at set to datetime.now(timezone.utc).
+           - raw_entry stored as the original dict.
+        3. Call backend.upsert_asset(record).
+        4. Return True if new, False if duplicate.
+
+        Raises CatalogIngestError if schema_version is not 2 or if
+        required fields are missing from raw_entry.
+        """
+
+    def ingest_batch(
+        self,
+        entries: list[tuple[dict, str, str | None]],
+    ) -> "IngestResult":
+        """Ingest multiple IndexEntries in a single operation.
+
+        Each tuple contains (raw_entry, storage_mode, inline_content).
+        Calls self.ingest() for each entry. Individual failures are
+        recorded but do not abort the batch.
+
+        Returns an IngestResult summarizing the operation.
+        """
+```
+
+**CatalogSearcher** (defined in `catalog/search.py`):
+
+```python
+class CatalogSearcher:
+    """Catalog read-path API. Builds queries and returns structured results."""
+
+    def __init__(self, backend: CatalogBackend) -> None:
+        """Initialize with a configured catalog backend."""
+
+    def search(self, query: "SearchQuery") -> "SearchResult":
+        """Execute a search query against the catalog.
+
+        Delegates to backend.search() after validating the query.
+        Returns a SearchResult containing matching AssetRecords and
+        a total count for pagination.
+        """
+
+    def get(self, asset_id: str) -> "AssetRecord | None":
+        """Retrieve a single asset by its content-addressed id.
+
+        Delegates to backend.get_by_id(). Returns None if not found.
+        """
+
+    def get_by_storage_name(self, storage_name: str) -> "AssetRecord | None":
+        """Retrieve a single asset by its vault storage key.
+
+        Delegates to backend.get_by_storage_name(). Returns None if
+        not found.
+        """
+
+    def count(self) -> int:
+        """Return the total number of assets in the catalog.
+
+        Delegates to backend.count().
+        """
+```
+
+#### 6.4.3. Shared Types
+
+Defined in `catalog/__init__.py`. These types are the catalog module's public contract, consumed by the sync module, CLI, and any future callers.
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+
+
+@dataclass(frozen=True)
+class AssetRecord:
+    """A single asset as represented in the catalog.
+
+    Used on both the write path (CatalogIngestor builds one from an
+    IndexEntry) and the read path (CatalogBackend returns them from
+    queries). Field names correspond to the assets table columns
+    defined in §6.8.
+    """
+
+    id: str
+    schema_version: int
+    type: str                        # "file" or "directory"
+    mime_type: str | None
+    extension: str | None
+    name_text: str | None
+    name_normalized: str | None
+    size_bytes: int | None
+    ts_modified: datetime | None
+    ts_created: datetime | None
+    storage_name: str
+    storage_mode: str                # "vault" or "inline"
+    raw_entry: dict                  # complete IndexEntry, deserialized
+    inline_content: str | None
+    ingested_at: datetime
+
+
+@dataclass(frozen=True)
+class SearchQuery:
+    """Parameters for a catalog search operation.
+
+    All filter fields are optional. When None, the filter is not applied.
+    Multiple filters combine with AND logic. An empty SearchQuery (all
+    fields None/default) matches all assets.
+    """
+
+    text_query: str | None = None          # full-text search string (FTS)
+    mime_type: str | None = None           # exact match (e.g., "image/jpeg")
+    mime_prefix: str | None = None         # prefix match (e.g., "text/")
+    extension: str | None = None           # exact match, no leading dot
+    type: str | None = None                # "file" or "directory"
+    size_min: int | None = None            # inclusive lower bound on size_bytes
+    size_max: int | None = None            # inclusive upper bound on size_bytes
+    modified_after: datetime | None = None  # exclusive lower bound on ts_modified
+    modified_before: datetime | None = None # exclusive upper bound on ts_modified
+    name_contains: str | None = None       # case-insensitive substring on name_text
+    limit: int = 100                       # max results to return
+    offset: int = 0                        # pagination offset
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """Result of a catalog search operation."""
+
+    items: tuple[AssetRecord, ...]   # matching assets for this page
+    total: int                       # total matches (ignoring limit/offset)
+    query: SearchQuery               # the query that produced this result
+
+
+@dataclass(frozen=True)
+class IngestResult:
+    """Result of a batch ingest operation."""
+
+    new: int           # count of newly inserted assets
+    duplicate: int     # count of assets skipped (already existed)
+    failed: int        # count of assets that failed validation
+    errors: tuple[tuple[str, str], ...]  # (asset_id_or_index, error_message)
+```
+
+`AssetRecord.raw_entry` is always a Python `dict` at the interface level. Backend implementations handle serialization to JSONB (PostgreSQL) or TEXT (SQLite) on write, and deserialization back to `dict` on read. Callers never interact with the serialized form.
+
+`SearchQuery.text_query` is passed to the database engine's native full-text search facility. For PostgreSQL, the backend converts it to a `tsquery` using `plainto_tsquery('simple', ...)`. For SQLite, the backend passes it to the FTS5 `MATCH` operator. The query string syntax is deliberately kept simple (space-separated terms with implicit AND) to avoid exposing backend-specific query languages to callers.
+
+### 6.5. Hybrid Storage Routing
 
 The catalog implements hybrid storage routing. Small text-based content (e.g., a 500-byte JSON response from an API feed) is stored inline as string data within the catalog database for instant full-text search. Large or binary content (e.g., a 4 GB video file) is routed to the vault. Both types are tracked by the same catalog with the same identity model.
 
@@ -467,13 +955,13 @@ Storage routing is determined by configurable rulesets and by explicit user dire
 
 These defaults are configurable via the `[storage_routing]` section of the configuration TOML ([§13](#13-configuration)). The configuration keys are `inline_mime_prefixes` (list of MIME type prefixes eligible for inline storage), `inline_max_bytes` (integer size threshold), and `inline_extra_types` (list of additional full MIME types eligible beyond the prefix list).
 
-### 6.5. Catalog-Indexer Contract
+### 6.6. Catalog-Indexer Contract
 
 The IndexEntry is a point-in-time snapshot. Its fields describe a file's identity, metadata, and filesystem state at the moment of indexing. Over time, content hashes change when content is modified, timestamps shift through normal filesystem operations, metadata evolves as external tools and source files change, and relative paths change when files are moved or index roots differ between runs.
 
 This transient nature is correct by design. The indexer produces accurate snapshots. The catalog receives them, correlates them across time, and maintains a durable record of identity evolution.
 
-### 6.6. Invariants
+### 6.7. Invariants
 
 - `id` is globally unique per content object. Duplicate ingest is idempotent.
 - Multiple references MAY point to a single asset. Assets do not belong to references.
@@ -481,11 +969,11 @@ This transient nature is correct by design. The indexer produces accurate snapsh
 - Physical deletion from the vault requires a separate, explicit prune operation.
 - The catalog does not store raw bytes (except inline string content per hybrid routing rules).
 
-### 6.7. Catalog Database Schema
+### 6.8. Catalog Database Schema
 
 This section defines the Phase 2 catalog schema. The schema covers the primary assets table required for IndexEntry ingestion, field projection, basic search, and hybrid inline storage. Reference tracking tables (collections, projects, tenants, snapshots) are deferred to Phase 4 and will be specified before that phase begins.
 
-#### 6.7.1. PostgreSQL Schema
+#### 6.8.1. PostgreSQL Schema
 
 ```sql
 CREATE TABLE assets (
@@ -530,11 +1018,27 @@ CREATE INDEX idx_assets_size_bytes  ON assets (size_bytes);
 CREATE INDEX idx_assets_ts_modified ON assets (ts_modified);
 CREATE INDEX idx_assets_name_text   ON assets USING gin (to_tsvector('simple', name_text));
 CREATE INDEX idx_assets_search      ON assets USING gin (search_vector);
+
+-- Full-text search trigger: rebuild search_vector on INSERT and UPDATE
+CREATE OR REPLACE FUNCTION assets_search_vector_update() RETURNS trigger AS $$
+BEGIN
+    NEW.search_vector :=
+        setweight(to_tsvector('simple', COALESCE(NEW.name_text, '')), 'A') ||
+        setweight(to_tsvector('simple', COALESCE(NEW.inline_content, '')), 'B');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_assets_search_vector
+    BEFORE INSERT OR UPDATE OF name_text, inline_content
+    ON assets
+    FOR EACH ROW
+    EXECUTE FUNCTION assets_search_vector_update();
 ```
 
-The `search_vector` column is maintained by a trigger that rebuilds it on INSERT and UPDATE from `name_text` and `inline_content` using the `'simple'` text search configuration.
+The `search_vector` column is maintained by the `trg_assets_search_vector` trigger, which fires before INSERT and before UPDATE of `name_text` or `inline_content`. The trigger function concatenates two weighted tsvectors using the `'simple'` text search configuration: `name_text` at weight A (highest relevance) and `inline_content` at weight B. `COALESCE` ensures that NULL values in either column do not produce a NULL vector. The `UPDATE OF` clause restricts the trigger to fire only when the indexed columns change, avoiding unnecessary recomputation on updates to unrelated columns.
 
-#### 6.7.2. SQLite Schema
+#### 6.8.2. SQLite Schema
 
 ```sql
 CREATE TABLE assets (
@@ -578,15 +1082,33 @@ CREATE VIRTUAL TABLE assets_fts USING fts5(
     content='assets',
     content_rowid='rowid'
 );
+
+-- FTS5 synchronization triggers for content-external table
+CREATE TRIGGER trg_assets_fts_insert AFTER INSERT ON assets BEGIN
+    INSERT INTO assets_fts(rowid, id, name_text, inline_content)
+    VALUES (NEW.rowid, NEW.id, NEW.name_text, NEW.inline_content);
+END;
+
+CREATE TRIGGER trg_assets_fts_delete AFTER DELETE ON assets BEGIN
+    INSERT INTO assets_fts(assets_fts, rowid, id, name_text, inline_content)
+    VALUES ('delete', OLD.rowid, OLD.id, OLD.name_text, OLD.inline_content);
+END;
+
+CREATE TRIGGER trg_assets_fts_update AFTER UPDATE ON assets BEGIN
+    INSERT INTO assets_fts(assets_fts, rowid, id, name_text, inline_content)
+    VALUES ('delete', OLD.rowid, OLD.id, OLD.name_text, OLD.inline_content);
+    INSERT INTO assets_fts(rowid, id, name_text, inline_content)
+    VALUES (NEW.rowid, NEW.id, NEW.name_text, NEW.inline_content);
+END;
 ```
 
-The SQLite FTS5 virtual table is kept synchronized with the `assets` table via triggers on INSERT, UPDATE, and DELETE. The `content=` and `content_rowid=` options configure FTS5 as a content-external table (it reads content from `assets` rather than storing its own copy).
+The SQLite FTS5 virtual table is configured as a content-external table (`content='assets'`, `content_rowid='rowid'`), meaning FTS5 reads content from the `assets` table rather than storing its own copy. This avoids doubling storage for indexed text. Content-external tables require explicit synchronization via triggers because FTS5 does not automatically detect changes in the source table. The delete trigger and the first statement of the update trigger use the FTS5 delete command (inserting the literal string `'delete'` as the first column value), which removes the old entry from the full-text index. The update trigger then inserts the new values. All three triggers fire AFTER the corresponding operation on `assets`, ensuring that `rowid` is available for newly inserted rows.
 
-#### 6.7.3. Schema Notes
+#### 6.8.3. Schema Notes
 
 The `raw_entry` column stores the complete, unmodified IndexEntry JSON as received from the indexer. This column is the source of truth for any field not projected into a dedicated column. Projected columns exist solely for query performance; they are derived from `raw_entry` at ingest time and MUST NOT be modified independently.
 
-The `inline_content` column is populated only when `storage_mode` is `'inline'`. When `storage_mode` is `'vault'`, this column is `NULL`. The vault stores the bytes; the catalog stores the metadata. This column is the single exception to that rule, as defined by the hybrid storage routing contract ([§6.4](#64-hybrid-storage-routing)).
+The `inline_content` column is populated only when `storage_mode` is `'inline'`. When `storage_mode` is `'vault'`, this column is `NULL`. The vault stores the bytes; the catalog stores the metadata. This column is the single exception to that rule, as defined by the hybrid storage routing contract ([§6.5](#65-hybrid-storage-routing)).
 
 The schema uses `TEXT` for the `id` column rather than a binary type because `id` values are hex-encoded hash strings in the IndexEntry contract and are frequently displayed, logged, and used in CLI output. Storing them as text avoids encode/decode overhead on every read path.
 
@@ -658,6 +1180,171 @@ metadexer MUST tolerate and recover from:
 - **Consistency over convenience.** Incomplete operations leave the system in a known, recoverable state.
 - **Explicit reconciliation over implicit repair.** The system surfaces discrepancies and requires deliberate action to resolve them.
 
+### 9.3. Exception Hierarchy
+
+All metadexer exceptions inherit from a common base class. The hierarchy is defined in `src/metadexer/exceptions.py` and re-exported from `src/metadexer/__init__.py` so that callers can import directly from `metadexer` or from `metadexer.exceptions`.
+
+```python
+class MetadexerError(Exception):
+    """Base class for all metadexer exceptions."""
+
+
+class ConfigurationError(MetadexerError):
+    """Configuration is invalid or incomplete.
+
+    Raised when:
+    - A TOML configuration file contains syntax errors.
+    - A required configuration value is missing (e.g., vault.root not set
+      when the local backend is selected).
+    - A configuration value has the wrong type or fails validation.
+    - An environment variable required for credential resolution is not set
+      when the corresponding backend is in use.
+    """
+
+
+# ── Vault exceptions ───────────────────────────────────────────────────────
+
+
+class VaultError(MetadexerError):
+    """Base class for vault module exceptions."""
+
+
+class VaultObjectNotFoundError(VaultError):
+    """A storage_name does not exist in the vault backend.
+
+    Raised by VaultBackend.get, VaultBackend.delete, and
+    VaultBackend.open_read when the requested object is absent.
+    Propagated by VaultStore.get, VaultStore.verify, and
+    VaultStore.prune (for individual deletion failures).
+    """
+
+
+class VaultHashCollisionError(VaultError):
+    """A storage_name already exists with different content.
+
+    This indicates that two distinct byte sequences produced the same
+    content-derived storage_name. This is a hash collision and represents
+    a data integrity violation. This exception is raised during explicit
+    verification (VaultStore.verify), not during put (which uses
+    head-then-write deduplication without content comparison).
+    """
+
+
+class VaultIOError(VaultError):
+    """An I/O operation on the vault backend failed.
+
+    Raised when the underlying storage system reports an error: file
+    permission denied, disk full, S3 transport error, network timeout,
+    or any other backend-specific I/O failure that is not a missing
+    object (which is VaultObjectNotFoundError). The original exception
+    is chained as the __cause__ for diagnostic purposes.
+    """
+
+
+# ── Catalog exceptions ─────────────────────────────────────────────────────
+
+
+class CatalogError(MetadexerError):
+    """Base class for catalog module exceptions."""
+
+
+class CatalogIngestError(CatalogError):
+    """An IndexEntry failed validation during catalog ingestion.
+
+    Raised when:
+    - schema_version is not 2.
+    - A required IndexEntry field is missing or has the wrong type.
+    - An IndexEntry cannot be projected into an AssetRecord due to
+      structural issues in the raw entry dict.
+
+    The error message includes the asset id (if available) and a
+    description of the validation failure.
+    """
+
+
+class CatalogConnectionError(CatalogError):
+    """The catalog database is unreachable or authentication failed.
+
+    Raised by backend constructors or on first query when the database
+    connection cannot be established. For PostgreSQL: connection refused,
+    authentication failure, database does not exist. For SQLite: database
+    file path is not writable, file is locked by another process.
+    The original driver exception is chained as __cause__.
+    """
+
+
+class CatalogSchemaError(CatalogError):
+    """Schema initialization or validation failed.
+
+    Raised by CatalogBackend.initialize_schema when the CREATE TABLE
+    or CREATE INDEX statements fail, or when an existing schema is
+    detected that is incompatible with the expected structure.
+    """
+
+
+# ── Sync exceptions ────────────────────────────────────────────────────────
+
+
+class SyncError(MetadexerError):
+    """Base class for sync module exceptions."""
+
+
+class IndexerInvocationError(SyncError):
+    """shruggie-indexer invocation failed.
+
+    Raised when the sync module cannot obtain IndexEntry records from
+    the indexer. For library-mode invocation: the index_path() call
+    raised an exception. For subprocess-mode invocation: the process
+    returned a non-zero exit code or produced unparseable output. The
+    original exception or process stderr is chained or included in
+    the message.
+    """
+
+
+class SyncPipelineError(SyncError):
+    """An unrecoverable error occurred during pipeline execution.
+
+    Raised for pipeline-level failures that are not attributable to a
+    single component: for example, the vault is unreachable AND the
+    catalog is unreachable simultaneously, or a batch operation fails
+    in a way that leaves the pipeline in an unrecoverable state. This
+    is distinct from per-item failures (which are recorded in results
+    and do not raise exceptions) and from component-specific errors
+    (which use VaultError or CatalogError subtypes).
+    """
+```
+
+#### 9.3.1. CLI Exit Code Mapping
+
+The CLI translates exception types to exit codes. This mapping ensures that scripts and CI pipelines can distinguish between failure categories programmatically.
+
+| Exit code | Exception type | Meaning |
+|-----------|---------------|---------|
+| 0 | (none) | Success. |
+| 1 | Unhandled exception | Unexpected error (bug). |
+| 2 | `ConfigurationError` | Invalid or incomplete configuration. |
+| 3 | `VaultError` (any subtype) | Vault operation failed. |
+| 4 | `CatalogError` (any subtype) | Catalog operation failed. |
+| 5 | `SyncError` (any subtype) | Sync pipeline or indexer invocation failed. |
+
+The CLI's top-level exception handler catches `MetadexerError` subtypes, logs the error message to `stderr`, and exits with the corresponding code. Unhandled exceptions (exit code 1) include a traceback in debug log output but display only a user-friendly message at the default log level.
+
+#### 9.3.2. Exception Chaining Convention
+
+When a metadexer exception wraps an underlying cause (a database driver error, an OS error, an indexer exception), the original exception MUST be chained using Python's `raise ... from ...` syntax. This preserves the full diagnostic chain for debugging while allowing callers to catch the metadexer-level exception type without knowing the underlying driver.
+
+```python
+# Correct: chain the original cause
+try:
+    connection = psycopg.connect(dsn)
+except psycopg.OperationalError as e:
+    raise CatalogConnectionError(f"cannot connect to PostgreSQL: {e}") from e
+
+# Incorrect: swallow the cause
+except psycopg.OperationalError as e:
+    raise CatalogConnectionError(f"cannot connect to PostgreSQL: {e}")
+```
+
 ---
 
 ## 10. Repository Structure
@@ -716,6 +1403,7 @@ src/metadexer/
 ├── __init__.py
 ├── _version.py
 ├── cli.py
+├── exceptions.py             # exception hierarchy (§9.3)
 ├── vault/
 │   ├── __init__.py
 │   ├── store.py              # core put/get/head/verify logic
@@ -1934,5 +2622,9 @@ None of these capabilities require redefining content identity. The IndexEntry c
 |------|---------|--------|
 | <span style="white-space: nowrap;">2026-03-07</span> | DRAFT | Initial specification. Derived from the metadexer high-level overview (`20260305-004-metadexer-overview.md`). Establishes architectural contracts, module responsibilities, invariants, and development phasing sufficient for sprint planning. |
 | <span style="white-space: nowrap;">2026-03-09</span> | DRAFT | Merged the standalone development workflow document (`metadexer-development-workflow.md`, dated 2026-03-08) into the specification as §23. Expanded handoff protocol with concrete artifact formats, session report schema, and agent session transcript preservation guidance. Introduced `.handoff/plans/` and `.handoff/reports/` directory structure, replacing the prior use of `.archive/` as the handoff location. `.archive/` is retained for historical document storage only. Added `CLAUDE.md` and `.github/copilot-instructions.md` as defined agent context files with synchronization requirements. Updated repository structure (§10) to reflect new directories and files. Added workflow-related terms to the terminology table (§1.5). Renumbered §23 (Composition Rules) to §24 and §24 (Future Considerations) to §25. |
-| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 1 gap resolution pass. Added catalog database schema for PostgreSQL and SQLite (§6.7). Added canonical `pyproject.toml` configuration (§18.1) and version management details (§18.3). Added literal agent context file contents for `CLAUDE.md` and `.github/copilot-instructions.md` (§23.6.1). Added configuration TOML structure with all Phase 2 keys and defaults (§13.3). Added default storage routing thresholds and ruleset (§6.4). Specified vault local backend directory layout with two-character prefix sharding (§5.3). Defined shruggie-indexer invocation method as library-first with subprocess fallback (§15.1). Clarified vault `get` operation accepts `storage_name` only, not `id` (§5.2). Resolved license field contradiction in §10.1. Removed hedging language from CLI subcommand tree (§12.1). Specified changelog copy automation as a docs CI build step (§11.3). Updated §21.3 to reference concrete sharding and chunk size specifications. |
+| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 1 gap resolution pass. Added catalog database schema for PostgreSQL and SQLite (§6.8). Added canonical `pyproject.toml` configuration (§18.1) and version management details (§18.3). Added literal agent context file contents for `CLAUDE.md` and `.github/copilot-instructions.md` (§23.6.1). Added configuration TOML structure with all Phase 2 keys and defaults (§13.3). Added default storage routing thresholds and ruleset (§6.5). Specified vault local backend directory layout with two-character prefix sharding (§5.3). Defined shruggie-indexer invocation method as library-first with subprocess fallback (§15.1). Clarified vault `get` operation accepts `storage_name` only, not `id` (§5.2). Resolved license field contradiction in §10.1. Removed hedging language from CLI subcommand tree (§12.1). Specified changelog copy automation as a docs CI build step (§11.3). Updated §21.3 to reference concrete sharding and chunk size specifications. |
 | <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Retired `_TEMPLATE.txt` session prompt template convention from §23. Sprint documents are the sole admin-to-coding handoff artifact. Removed template references from §10.1, §23.2.1, §23.3.1, §23.3.2, §23.6.2, and §23.9. |
+| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 2 gap resolution: added vault backend interface (§5.4). Defined `VaultBackend` abstract base class with method signatures for put, get, head, delete, open_read, and iter_storage_names. Defined `VaultStore` facade with deduplication, streaming hash verification, and prune orchestration. Defined `VerifyResult` and `PruneResult` frozen dataclasses. Renumbered §5.4 (Invariants) to §5.5 and §5.5 (Verification Modes) to §5.6. Updated all cross-references. |
+| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 2 gap resolution: added catalog backend interface (§6.4). Defined `CatalogBackend` abstract base class with method signatures for initialize_schema, upsert_asset, get_by_id, get_by_storage_name, search, count, iter_all_storage_names, and close. Defined `CatalogIngestor` (write-path) and `CatalogSearcher` (read-path) facade classes. Defined shared types: `AssetRecord`, `SearchQuery`, `SearchResult`, and `IngestResult` as frozen dataclasses. Renumbered §6.4 (Hybrid Storage Routing) through §6.7 (Catalog Database Schema) to §6.5 through §6.8. Updated all cross-references. |
+| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 2 gap resolution: added exception hierarchy (§9.3). Defined `MetadexerError` base class with module-scoped subtypes: `ConfigurationError`, `VaultError` (with `VaultObjectNotFoundError`, `VaultHashCollisionError`, `VaultIOError`), `CatalogError` (with `CatalogIngestError`, `CatalogConnectionError`, `CatalogSchemaError`), and `SyncError` (with `IndexerInvocationError`, `SyncPipelineError`). Added CLI exit code mapping (§9.3.1) and exception chaining convention (§9.3.2). Added `exceptions.py` to the source package layout in §10.2. |
+| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 2 gap resolution: added SQL trigger definitions to catalog database schema (§6.8). PostgreSQL: added `assets_search_vector_update()` function and `trg_assets_search_vector` trigger for tsvector maintenance with weighted A/B ranking on name_text and inline_content. SQLite: added `trg_assets_fts_insert`, `trg_assets_fts_delete`, and `trg_assets_fts_update` triggers for FTS5 content-external table synchronization. |
