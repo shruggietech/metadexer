@@ -1,0 +1,90 @@
+# ─── Build system ───────────────────────────────────────────────────────────
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ─── Package metadata ──────────────────────────────────────────────────────
+
+[project]
+name = "metadexer"
+description = "Content-addressed asset management with deep metadata search, hybrid storage routing, and temporal observation tracking"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{name = "William Thompson"}]
+keywords = ["asset-management", "content-addressed", "metadata", "indexer", "deduplication"]
+dynamic = ["version"]
+dependencies = [
+    "click>=8.1",
+    "orjson>=3.9",
+    "shruggie-indexer>=0.1.2",
+]
+
+[project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.1",
+]
+s3 = [
+    "boto3>=1.28",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.3",
+    "metadexer[postgres,s3]",
+]
+
+# ─── Entry points ──────────────────────────────────────────────────────────
+
+[project.scripts]
+metadexer = "metadexer.cli:main"
+
+# ─── Hatchling configuration ───────────────────────────────────────────────
+
+[tool.hatch.version]
+path = "src/metadexer/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/metadexer"]
+
+# ─── Pytest ────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "platform_windows: marks tests that only run on Windows",
+    "platform_linux: marks tests that only run on Linux",
+    "platform_macos: marks tests that only run on macOS",
+    "requires_postgres: marks tests that require a PostgreSQL instance",
+    "requires_s3: marks tests that require an S3-compatible endpoint",
+]
+
+# ─── Ruff ──────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # ruff-specific rules
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["metadexer"]
