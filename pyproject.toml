@@ -61,6 +61,7 @@ markers = [
     "platform_windows: marks tests that only run on Windows",
     "platform_linux: marks tests that only run on Linux",
     "platform_macos: marks tests that only run on macOS",
+    "postgres: marks tests that require a PostgreSQL instance",
     "requires_postgres: marks tests that require a PostgreSQL instance",
     "requires_s3: marks tests that require an S3-compatible endpoint",
 ]
