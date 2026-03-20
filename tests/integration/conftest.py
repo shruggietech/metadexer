@@ -4,7 +4,10 @@ import os
 
 import pytest
 
-from metadexer.catalog.backends.postgres import PostgresCatalogBackend
+try:
+    from metadexer.catalog.backends.postgres import PostgresCatalogBackend
+except ImportError:
+    PostgresCatalogBackend = None
 
 
 @pytest.fixture(scope="session")
