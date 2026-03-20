@@ -23,7 +23,7 @@ metadexer/
 ├── scripts/            # Dev environment setup and build scripts
 ├── src/metadexer/      # Python source package
 │   ├── cli.py          # CLI entry point (click)
-│   ├── vault/          # Content-addressed byte storage
+│   ├── vault/          # Content-addressed storage (files and inline text)
 │   ├── catalog/        # Metadata registry, search, references
 │   └── sync/           # Ingestion pipeline orchestration
 ├── tests/              # Test suites (unit/, integration/, conformance/, platform/)

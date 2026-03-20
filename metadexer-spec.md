@@ -161,8 +161,8 @@ This specification does NOT serve as a user guide, tutorial, or API reference. T
 
 #### In Scope
 
-- **Vault module.** Content-addressed byte storage with local filesystem and S3-compatible backends. Put, get, head, verify, and prune operations.
-- **Catalog module.** Metadata registry and search engine. IndexEntry ingestion, field projection, basic and full-text search, hybrid storage routing, reference tracking, and temporal correlation. PostgreSQL and SQLite backends.
+- **Vault module.** Content-addressed storage (file-based and inline text) with local filesystem and S3-compatible backends. Put, get, head, verify, and prune operations.
+- **Catalog module.** Metadata registry and search engine. IndexEntry ingestion, field projection, basic and full-text search, full-text search indexing of vault-stored inline content, reference tracking, and temporal correlation. PostgreSQL and SQLite backends.
 - **Sync module.** Ingestion pipeline orchestration. Sync Plan generation, deduplication, storage routing, resumable uploads, and idempotent catalog commits.
 - **CLI interface.** The canonical user interface for all operations, built on `click`.
 - **Configuration system.** Layered TOML configuration with compiled defaults, user config, project-local config, and CLI overrides.
@@ -1557,6 +1557,7 @@ src/metadexer/
 ├── _version.py
 ├── cli.py
 ├── exceptions.py             # exception hierarchy (§9.3)
+├── config.py                 # configuration loading and dataclasses (§13)
 ├── vault/
 │   ├── __init__.py
 │   ├── store.py              # core put/get/head/verify logic
@@ -2185,7 +2186,6 @@ The coding layer is responsible for implementing the work defined by the admin l
 | Artifact | Source | How it is obtained |
 |----------|--------|--------------------|
 | <span style="white-space: nowrap;">Sprint planning document</span> | `.handoff/plans/` | The project lead provides the file path or pastes the content into the agent's context window. The agent reads it from the repository if operating in a worktree with the latest `main` state. |
-| <span style="white-space: nowrap;">Session prompt template</span> | `.handoff/plans/` | Fed to the agent as the initial prompt at session start. |
 | <span style="white-space: nowrap;">Technical specification</span> | Repository root | The agent reads the specification file for the component under modification. The project lead MAY explicitly include it in the context window or instruct the agent to read it. |
 | <span style="white-space: nowrap;">Agent context file</span> | `CLAUDE.md` (auto-read by Claude Code) or `.github/copilot-instructions.md` (auto-read by GitHub Copilot) | Loaded automatically by the tool at session start. No manual step required. |
 | <span style="white-space: nowrap;">Current codebase state</span> | Git repository | The agent inspects the repository independently. Agents MUST NOT assume the codebase matches any prior description; they verify it directly using grep, file reads, and test execution. |
@@ -2458,13 +2458,13 @@ The following are the literal file contents to be committed to the repository. T
 metadexer/
 ├── .archive/           # Historical/retired documents
 ├── .github/            # GitHub config, CI workflows, Copilot instructions
-├── .handoff/plans/     # Sprint documents and prompt templates (admin → coding)
+├── .handoff/plans/     # Sprint documents (admin → coding)
 ├── .handoff/reports/   # Session reports and test summaries (coding → admin)
 ├── docs/               # MkDocs documentation site source
 ├── scripts/            # Dev environment setup and build scripts
 ├── src/metadexer/      # Python source package
 │   ├── cli.py          # CLI entry point (click)
-│   ├── vault/          # Content-addressed byte storage
+│   ├── vault/          # Content-addressed storage (files and inline text)
 │   ├── catalog/        # Metadata registry, search, references
 │   └── sync/           # Ingestion pipeline orchestration
 ├── tests/              # Test suites (unit/, integration/, conformance/, platform/)
@@ -2547,13 +2547,13 @@ metadexer/
 metadexer/
 ├── .archive/           # Historical/retired documents
 ├── .github/            # GitHub config, CI workflows, Copilot instructions
-├── .handoff/plans/     # Sprint documents and prompt templates (admin → coding)
+├── .handoff/plans/     # Sprint documents (admin → coding)
 ├── .handoff/reports/   # Session reports and test summaries (coding → admin)
 ├── docs/               # MkDocs documentation site source
 ├── scripts/            # Dev environment setup and build scripts
 ├── src/metadexer/      # Python source package
 │   ├── cli.py          # CLI entry point (click)
-│   ├── vault/          # Content-addressed byte storage
+│   ├── vault/          # Content-addressed storage (files and inline text)
 │   ├── catalog/        # Metadata registry, search, references
 │   └── sync/           # Ingestion pipeline orchestration
 ├── tests/              # Test suites (unit/, integration/, conformance/, platform/)
@@ -2783,3 +2783,4 @@ None of these capabilities require redefining content identity. The IndexEntry c
 | <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 2 gap resolution: added exception hierarchy (§9.3). Defined `MetadexerError` base class with module-scoped subtypes: `ConfigurationError`, `VaultError` (with `VaultObjectNotFoundError`, `VaultHashCollisionError`, `VaultIOError`), `CatalogError` (with `CatalogIngestError`, `CatalogConnectionError`, `CatalogSchemaError`), and `SyncError` (with `IndexerInvocationError`, `SyncPipelineError`). Added CLI exit code mapping (§9.3.1) and exception chaining convention (§9.3.2). Added `exceptions.py` to the source package layout in §10.2. |
 | <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Pre-Sprint 2 gap resolution: added SQL trigger definitions to catalog database schema (§6.8). PostgreSQL: added `assets_search_vector_update()` function and `trg_assets_search_vector` trigger for tsvector maintenance with weighted A/B ranking on name_text and inline_content. SQLite: added `trg_assets_fts_insert`, `trg_assets_fts_delete`, and `trg_assets_fts_update` triggers for FTS5 content-external table synchronization. |
 | <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Architectural change: moved inline text content storage from the catalog module to the vault module. The vault is now the sole owner of all stored content (file-based and inline text). Added vault inline database surface (§5.4.4) with `VaultInlineStore` class and `vault_inline` table schema for both PostgreSQL and SQLite. Added `vault/inline.py` to source package layout (§10.2). Split §5.2 into §5.2.1 (file-based operations) and §5.2.2 (inline operations) with `put_inline` and `get_inline`. Updated `VaultStore` facade (§5.4.2) with `inline_store` parameter and inline methods. Expanded §5.3 (Storage Backends) and §5.5 (Invariants) to cover both storage surfaces. Removed `inline_content` column from catalog `assets` table in both PostgreSQL (§6.8.1) and SQLite (§6.8.2) schemas. Removed `inline_content` field from `AssetRecord` (§6.4.3). Replaced PostgreSQL trigger-based tsvector maintenance with application-side computation at INSERT time (§6.8.1). Switched SQLite FTS5 from content-external mode to standalone mode (§6.8.2). Renamed `CatalogIngestor.ingest()` parameter from `inline_content` to `search_text` (§6.4.2) and added `search_text` parameter to `CatalogBackend.upsert_asset()` (§6.4.1). Renamed §6.5 from "Hybrid Storage Routing" to "Storage Routing" and reframed as vault-internal routing. Updated §1.5 (Vault terminology), §3.1 (Component Map), §3.2 (Module Responsibilities), §3.3 (Data Flow), §6.7 (Invariants), §6.8.3 (Schema Notes), §7.2 (Pipeline Stages), and §22.1 (Phase 2 scope). |
+| <span style="white-space: nowrap;">2026-03-19</span> | DRAFT | Sprint 003 cleanup: removed stale "Session prompt template" row from §23.2.2. Updated §1.2 scope descriptions and §23.6.1 agent context file content to reflect vault-owned inline storage architecture. Added `config.py` to §10.2 source package layout. |
